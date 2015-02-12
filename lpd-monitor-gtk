@@ -1,0 +1,161 @@
+#!/usr/bin/env python
+
+from gi.repository import Gtk
+from gi.repository import GObject
+from gi.repository import Pango
+from gi.repository import GLib
+
+import datetime
+
+import lpd
+from hashutils import bintohex, hextobin
+
+class Torrent(GObject.GObject):
+    __gsignals__ = {
+        'changed': (GObject.SIGNAL_RUN_FIRST, None, (int,)),
+        }
+
+    def __init__(self, infohash):
+        super(Torrent, self).__init__()
+        self._infohash = infohash
+        self._peers = set()
+        self._update_time = None
+
+    def __hash__(self):
+        return hash(self._infohash)
+
+    @property
+    def infohash(self):
+        return self._infohash
+
+    @property
+    def infohash_hex(self):
+        return bintohex(self.infohash)
+
+    @property
+    def peers(self):
+        return iter(self._peers)
+
+    @property
+    def update_time(self):
+        return self._update_time
+
+    def add_peer(self, address):
+        self._peers.add(address)
+        self._update()
+
+    def remove_peer(self, address):
+        self._peers.remove(address)
+        self._update()
+
+    def _update(self):
+        self._update_time = datetime.datetime.now()
+        self.emit('changed', 0)
+
+    def __repr__(self):
+        return '<Torrent {}>'.format(self.infohash_hex)
+
+class TorrentLibrary(GObject.GObject):
+    __gsignals__ = {
+        'torrent-added': (GObject.SIGNAL_RUN_FIRST, None, (object,)),
+        'torrent-changed': (GObject.SIGNAL_RUN_FIRST, None, (object,))
+        }
+
+    def __init__(self):
+        super(TorrentLibrary, self).__init__()
+        self._torrents = {}
+
+    def torrent(self, infohash):
+        if infohash not in self._torrents:
+            torrent = Torrent(infohash)
+            self._torrents[infohash] = torrent
+            torrent.connect('changed', self._torrent_changed_cb)
+            self.emit('torrent-added', torrent)
+        return self._torrents[infohash]
+
+    @property
+    def torrents(self):
+        return self._torrents.itervalues()
+
+    def _torrent_changed_cb(self, torrent, data):
+        self.emit('torrent-changed', torrent)
+
+class LPDClient(GObject.GObject):
+    __gsignals__ = {
+        'torrent-announced': (GObject.SIGNAL_RUN_FIRST, None, (str, str, int)),
+        }
+
+    def __init__(self):
+        super(LPDClient, self).__init__()
+
+        self._socket = lpd.LPDSocket()
+        GLib.io_add_watch(self._socket, GLib.IO_IN, self._socket_input_cb)
+
+    def _socket_input_cb(self, source, cond):
+        data, sender = self._socket.recv_announce()
+        if data is None:
+            return True
+
+        ip, _ = sender
+        infohash, port = data
+        address = (ip, port)
+
+        self.emit('torrent-announced', bintohex(infohash), address, port)
+
+        return True
+
+
+
+if __name__ == '__main__':
+    client = LPDClient()
+    lib = TorrentLibrary()
+    m = Gtk.ListStore(object)
+    t = Gtk.TreeView(m)
+
+    def torrent_announce_cb(client, infohash, address, port):
+        torrent = lib.torrent(hextobin(infohash))
+        torrent.add_peer((address, port))
+
+    client.connect('torrent-announced', torrent_announce_cb)
+
+    def torrent_added_cb(library, torrent):
+        print('Library added: {}'.format(torrent))
+        m.append([torrent])
+
+    def torrent_changed_cb(library, torrent):
+        print('Library changed: {}'.format(torrent))
+
+    lib.connect('torrent-added', torrent_added_cb)
+    lib.connect('torrent-changed', torrent_changed_cb)
+
+    def torrents_infohash_data_cb(column, cell, model, it, data):
+        cell.set_property('text', model.get_value(it, 0).infohash_hex)
+
+    def torrents_update_time_data_cb(column, cell, model, it, data):
+        cell.set_property('text', model.get_value(it, 0).update_time)
+
+    torrents_infohash_cell = Gtk.CellRendererText()
+    torrents_infohash_cell.set_property('ellipsize', Pango.EllipsizeMode.END)
+    torrents_infohash_cell.set_property('ellipsize-set', True)
+    torrents_infohash_col = Gtk.TreeViewColumn('Infohash', torrents_infohash_cell)
+    torrents_infohash_col.set_resizable(True)
+    torrents_infohash_col.set_cell_data_func(torrents_infohash_cell, torrents_infohash_data_cb)
+    t.append_column(torrents_infohash_col)
+
+    torrents_update_time_cell = Gtk.CellRendererText()
+    torrents_update_time_cell.set_property('ellipsize', Pango.EllipsizeMode.END)
+    torrents_update_time_cell.set_property('ellipsize-set', True)
+    torrents_update_time_col = Gtk.TreeViewColumn('Last update', torrents_update_time_cell)
+    torrents_update_time_col.set_resizable(True)
+    torrents_update_time_col.set_cell_data_func(torrents_update_time_cell, torrents_update_time_data_cb)
+    t.append_column(torrents_update_time_col)
+
+    def main_window_destroy_cb(window):
+        Gtk.main_quit()
+
+    w = Gtk.Window()
+    w.connect('destroy', main_window_destroy_cb)
+    w.add(t)
+    w.show_all()
+
+    Gtk.main()
